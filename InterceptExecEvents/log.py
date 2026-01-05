@@ -1,12 +1,9 @@
 from datetime import datetime, timedelta
+import asyncio
 import json
-import os
 
 from gzip import GzipFile
 from zstandard import ZstdCompressor, FLUSH_FRAME
-
-from pyroute2.netlink.connector.cn_proc import PROC_EVENT_EXEC
-from pyroute2 import ProcEventSocket
 
 class LogHandler():
     last_gzip_tell = 0
@@ -29,8 +26,8 @@ class LogHandler():
     @classmethod
     def begin_next_file(cls):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname_zstd = f"procevents/{timestamp}.jsonl.zst"
-        fname_gzip = f"procevents/{timestamp}.jsonl.gz"
+        fname_zstd = f"execevents/{timestamp}.jsonl.zst"
+        fname_gzip = f"execevents/{timestamp}.jsonl.gz"
 
         print("Creating", fname_zstd)
         print("Creating", fname_gzip)
@@ -78,115 +75,171 @@ class LogHandler():
             self.last_gzip_tell = self.urls_gzip.fileobj.tell()
             print("Flush gzip")
 
+
+# https://github.com/bpftrace/bpftrace/blob/master/tools/execsnoop.bt
+# https://docs.python.org/3/library/asyncio-subprocess.html#asyncio.create_subprocess_exec
+# https://mozillazg.com/2024/03/ebpf-tracepoint-syscalls-sys-enter-execve-can-not-get-filename-argv-values-case-en.html
+#
+
+async def read_events_syscall(handler):
+    proc = await asyncio.create_subprocess_exec(
+        "bpftrace",
+        "-e",
+        """
+        // With programs that spawn other programs, esp. `make -j`
+        // a lot of sys_enter_exec* may occur before
+        // any sys_exit_exec*
+
+        // Keep in mind: with join(), argv is truncated to 16 arguments
+        tracepoint:syscalls:sys_enter_exec* {
+            printf(
+                \"ENTER\\0%s\\0%s\\0%d\\0\",
+                strftime("%Y-%m-%dT%H:%M:%S%z", nsecs),
+                comm,
+                pid
+            );
+            join(args->argv);
+        }
+
+        tracepoint:syscalls:sys_exit_exec* {
+            printf(\"LEAVE\\0%d\\0%d\\0\", pid, args->ret);
+        }
+        """,
+        stdout=asyncio.subprocess.PIPE
+    )
+
+
+    assert await proc.stdout.readline() == b"Attaching 4 probes...\n"
+
+    posted = {}
+    solved = {}
+
+    # A little flimsy, this loop
+    # It functions despite preemption because of printf buffering
+    while True:
+        head = await proc.stdout.readuntil(b"\0")
+
+        if head == b"ENTER\0":
+            time = await proc.stdout.readuntil(b"\0")
+            comm = await proc.stdout.readuntil(b"\0")
+            pida = await proc.stdout.readuntil(b"\0")
+            argv = await proc.stdout.readuntil(b"\n")
+
+            time = time[:-1]
+            comm = comm[:-1]
+            pida = pida[:-1]
+            argv = argv[:-1]
+
+            assert pida not in posted
+
+            posted[pida] = dict(
+                time=time,
+                comm=comm,
+                argv=argv
+            )
+
+            pid = pida
+        elif head == b"LEAVE\0":
+            pidb = await proc.stdout.readuntil(b"\0")
+            retv = await proc.stdout.readuntil(b"\0")
+
+            pidb = pidb[:-1]
+            retv = retv[:-1]
+
+            assert pidb not in solved
+
+            solved[pidb] = dict(
+                retv=retv
+            )
+
+            pid = pidb
+        else:
+            assert 0, f"Protocol break: {head}"
+
+        if pid in posted and pid in solved:
+            retv = solved[pid]["retv"]
+            time = posted[pid]["time"]
+            comm = posted[pid]["comm"]
+            argv = posted[pid]["argv"]
+
+            if retv == b"0":
+                entry = dict(
+                    time=time.decode(),
+                    comm=comm.decode(),
+                    argv=argv.decode()
+                )
+
+                handler.ensure_schedule()
+                handler.handle_event(json.dumps(entry).encode())
+
+                print(json.dumps(entry, indent=2))
+
+            del posted[pid]
+            del solved[pid]
+
+# Alternative version that is unused at the present
+# May work on systems that lack syscall tracepoints
+async def read_events_sched():
+    proc = await asyncio.create_subprocess_exec(
+        "bpftrace",
+        "-B",
+        "none",
+        "-e",
+        """
+        #include <linux/sched.h>
+        #include <linux/mm_types.h>
+
+        // This tracepoint is distinct from tracepoint:syscalls:sys_enter_exec*;
+        // we only see successful execs here rather than all attempted
+        tracepoint:sched:sched_process_exec {
+            $task=curtask;
+            $arg_start=$task->mm->arg_start;
+            $arg_end=$task->mm->arg_end;
+            $count = $arg_end-$arg_start;
+
+            printf(\"%s\\0\", strftime("%Y-%m-%dT%H:%M:%S%z", nsecs));
+            printf(\"%s\\0\", comm);
+
+            // We have to get creative to print large buffers
+            // buf() is limited to 64 bytes by default
+            $i = (uint64)0;
+
+            while ($i < 4096) {
+                if ($count > $i) {
+                    printf(\"%r\", buf(uptr($arg_start + $i), $count - $i));
+                }
+
+                $i += 64;
+            }
+
+            printf(\"\\0\");
+        }
+        """,
+        stdout=asyncio.subprocess.PIPE
+    )
+
+    assert await proc.stdout.readline() == b"Attaching 1 probe...\n"
+
+    while True:
+        time = await proc.stdout.readuntil(b"\0")
+        comm = await proc.stdout.readuntil(b"\0")
+        argv = await proc.stdout.readuntil(b"\0")
+
+        time = time[:-1]
+        comm = comm[:-1]
+        argv = argv[:-1]
+
+        print(time, comm, argv)
+
 LogHandler.begin_next_file()
 handler = LogHandler()
 
-#
-# We must run with high priority in order to
-# catch short lived lower priority processes
-#
-# Unless we are root we cannot raise priority
-# only lower, and priotity -20 is still unreliable
-#
-# But if we are root, we can request realtime
-# and forkstat does that too:
-# https://github.com/ColinIanKing/forkstat/blob/master/forkstat.c
-#
-def set_priority():
-    try:
-        os.setpriority(0, 0, -20)
-    except PermissionError:
-        pass
-
-    print("My priority is", os.getpriority(0, 0))
-
-def set_realtime():
-    try:
-        max_fifo_prio = os.sched_get_priority_max(os.SCHED_FIFO)
-        os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(max_fifo_prio))
-        print("My RT priority is now", max_fifo_prio)
-    except PermissionError:
-        pass
-
-set_realtime()
-
-ps = ProcEventSocket()
-ps.bind()
-ps.control(listen=True)
-
-QUOT = "'"
-ESC = "\\"
-
-# We should always be able to read cmdline for pids obtained via proc events
-# Except when the process is short lived and we're too late to read its info
-def read_cmdline(pid):
-    try:
-        with open(f"/proc/{pid}/cmdline") as f:
-            args = []
-
-            for x in f.read().split("\0"):
-                if ' ' in x or not x:
-                    args.append(QUOT + x.replace(QUOT, QUOT + ESC + QUOT + QUOT) + QUOT)
-                else:
-                    args.append(x)
-
-            args.pop()
-
-            return " ".join(args)
-    except FileNotFoundError:
-        return "?"
-
-# Sometimes we cannot read where the executable is
-# eg. something run with sudo and we are not root
-def read_exe(pid):
-    try:
-        return os.readlink(f"/proc/{pid}/exe")
-    except (FileNotFoundError, PermissionError):
-        return "?"
-
-# See: man 5 proc
-# See: https://www.kernel.org/doc/Documentation/admin-guide/devices.txt
-def find_pty(pid):
-    try:
-        with open(f"/proc/{pid}/stat") as f:
-            stats = f.read().split(" ")
-            device = int(stats[6])
-            major = device >> 8
-            minor = device & 0xFF
-
-            if major == 136:
-                return f"pts/{minor}"
-
-            return "?"
-    except FileNotFoundError:
-        return "?"
-
 try:
-    while True:
-        event = ps.get()
-
-        assert len(event) == 1
-
-        if event[0]["what"] == PROC_EVENT_EXEC:
-            process_pid = event[0]["process_pid"]
-            entry = {
-                "time": datetime.now().replace(microsecond=0).astimezone().isoformat(),
-                "executable": read_exe(process_pid),
-                "cmdline": read_cmdline(process_pid),
-                "tty": find_pty(process_pid)
-            }
-
-            LogHandler.ensure_schedule()
-            handler.handle_event(json.dumps(entry).encode())
-
-            print(json.dumps(entry, indent=2))
-
+    asyncio.run(read_events_syscall(handler))
 except KeyboardInterrupt:
     pass
 finally:
     print("Shutting down...")
-
-    ps.close()
 
     LogHandler.urls_zstd.close()
     LogHandler.urls_gzip.close()
