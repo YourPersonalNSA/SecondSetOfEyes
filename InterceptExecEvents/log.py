@@ -75,7 +75,6 @@ class LogHandler():
             self.last_gzip_tell = self.urls_gzip.fileobj.tell()
             print("Flush gzip")
 
-
 # https://github.com/bpftrace/bpftrace/blob/master/tools/execsnoop.bt
 # https://docs.python.org/3/library/asyncio-subprocess.html#asyncio.create_subprocess_exec
 # https://mozillazg.com/2024/03/ebpf-tracepoint-syscalls-sys-enter-execve-can-not-get-filename-argv-values-case-en.html
@@ -91,14 +90,24 @@ async def read_events_syscall(handler):
         // any sys_exit_exec*
 
         // Keep in mind: with join(), argv is truncated to 16 arguments
+        // we use own loop over argv instead
         tracepoint:syscalls:sys_enter_exec* {
             printf(
-                \"ENTER\\0%s\\0%s\\0%d\\0\",
+                "ENTER\\0%s\\0%s\\0%d\\0",
                 strftime("%Y-%m-%dT%H:%M:%S%z", nsecs),
                 comm,
                 pid
             );
-            join(args->argv);
+
+            $i = 0;
+
+            while ($i < 4096) {
+                if ( (uint64)*(args->argv+$i) == 0 ) { break; }
+                printf("%s ", str(*(args->argv+$i)));
+                $i++
+            }
+
+            printf("\\n");
         }
 
         tracepoint:syscalls:sys_exit_exec* {
