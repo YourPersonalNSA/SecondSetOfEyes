@@ -80,38 +80,77 @@ class LogHandler():
 # https://mozillazg.com/2024/03/ebpf-tracepoint-syscalls-sys-enter-execve-can-not-get-filename-argv-values-case-en.html
 #
 
+# Executable invocation event tracer
+#
+# With programs that spawn other programs, esp. `make -j`, a lot
+# of sys_enter_exec* may occur before any sys_exit_exec*, so we
+# must keep track of issued/resolved syscalls
+#
 async def read_events_syscall(handler):
     proc = await asyncio.create_subprocess_exec(
         "bpftrace",
         "-e",
         """
-        // With programs that spawn other programs, esp. `make -j`
-        // a lot of sys_enter_exec* may occur before
-        // any sys_exit_exec*
+        #include <linux/sched.h>
+        #include <linux/mm_types.h>
 
-        // Keep in mind: with join(), argv is truncated to 16 arguments
-        // we use own loop over argv instead
+        // We may look at args->argv, but:
+        // - with join(), argv is truncated to 16 arguments
+        // - with own loop over argv, args are truncated to 64 bytes
+        //
+        // We look at curtask->mm->arg_start instead
+        //
         tracepoint:syscalls:sys_enter_exec* {
-            printf(
-                "ENTER\\0%s\\0%s\\0%d\\0",
+            $task=curtask;
+            $arg_start=$task->mm->arg_start;
+            $arg_end=$task->mm->arg_end;
+            $count = $arg_end-$arg_start;
+
+            // We have to get creative to print large buffers
+            // buf() is limited to 64 bytes by default
+            $i = (uint64)0;
+
+            // We loop in a slightly roundabout way to avoid
+            // a dynamic buf size as best we can
+            //
+            // dynamic buf size upsets the verifier, causing
+            // excessive branching
+            while ($i < 65536) {
+                if ($i + 64 > $count) { break; }
+
+                printf("%r", buf(uptr($arg_start + $i), 64));
+
+                $i += 64;
+            }
+
+            // Final print
+            printf("%r\\0ENTER\\0%s\\0%s\\0%d\\n",
+                buf(uptr($arg_start + $i), $count - $i),
                 strftime("%Y-%m-%dT%H:%M:%S%z", nsecs),
                 comm,
                 pid
             );
-
-            $i = 0;
-
-            while ($i < 4096) {
-                if ( (uint64)*(args->argv+$i) == 0 ) { break; }
-                printf("%s ", str(*(args->argv+$i)));
-                $i++
-            }
-
-            printf("\\n");
         }
 
         tracepoint:syscalls:sys_exit_exec* {
-            printf(\"LEAVE\\0%d\\0%d\\0\", pid, args->ret);
+            $task=curtask;
+            $arg_start=$task->mm->arg_start;
+            $arg_end=$task->mm->arg_end;
+            $count = $arg_end-$arg_start;
+
+            $i = (uint64)0;
+
+            while ($i < 65536) {
+                if ($i + 64 > $count) { break; }
+                printf("%r", buf(uptr($arg_start + $i), 64));
+                $i += 64;
+            }
+
+            printf("%r\\0LEAVE\\0%d\\0%d\\n",
+                buf(uptr($arg_start + $i), $count - $i),
+                pid,
+                args->ret
+            );
         }
         """,
         stdout=asyncio.subprocess.PIPE
@@ -123,16 +162,16 @@ async def read_events_syscall(handler):
     posted = {}
     solved = {}
 
-    # A little flimsy, this loop
-    # It functions despite preemption because of printf buffering
+    # A little flimsy, this wire protocol
+    # Some printf trampling may occur under high concurrency (it will crash)
     while True:
+        argv = await proc.stdout.readuntil(b"\0")
         head = await proc.stdout.readuntil(b"\0")
 
         if head == b"ENTER\0":
             time = await proc.stdout.readuntil(b"\0")
             comm = await proc.stdout.readuntil(b"\0")
-            pida = await proc.stdout.readuntil(b"\0")
-            argv = await proc.stdout.readuntil(b"\n")
+            pida = await proc.stdout.readuntil(b"\n")
 
             time = time[:-1]
             comm = comm[:-1]
@@ -144,21 +183,23 @@ async def read_events_syscall(handler):
             posted[pida] = dict(
                 time=time,
                 comm=comm,
-                argv=argv
+                argv=argv,
             )
 
             pid = pida
         elif head == b"LEAVE\0":
             pidb = await proc.stdout.readuntil(b"\0")
-            retv = await proc.stdout.readuntil(b"\0")
+            retv = await proc.stdout.readuntil(b"\n")
 
             pidb = pidb[:-1]
             retv = retv[:-1]
+            argv = argv[:-1]
 
             assert pidb not in solved
 
             solved[pidb] = dict(
-                retv=retv
+                retv=retv,
+                argv=argv
             )
 
             pid = pidb
@@ -169,22 +210,26 @@ async def read_events_syscall(handler):
             retv = solved[pid]["retv"]
             time = posted[pid]["time"]
             comm = posted[pid]["comm"]
-            argv = posted[pid]["argv"]
+            argx = posted[pid]["argv"]
+            argy = solved[pid]["argv"]
+
+            del posted[pid]
+            del solved[pid]
 
             if retv == b"0":
                 entry = dict(
                     time=time.decode(),
                     comm=comm.decode(),
-                    argv=argv.decode()
+                    argx=argx.decode("unicode_escape").split("\0"),
+                    argy=argy.decode("unicode_escape").split("\0")
                 )
 
                 handler.ensure_schedule()
                 handler.handle_event(json.dumps(entry).encode())
 
                 print(json.dumps(entry, indent=2))
-
-            del posted[pid]
-            del solved[pid]
+            else:
+                assert argx == argy
 
 # Alternative version that is unused at the present
 # May work on systems that lack syscall tracepoints
