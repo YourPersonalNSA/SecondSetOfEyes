@@ -3,7 +3,7 @@ import asyncio
 import json
 
 from gzip import GzipFile
-from zstandard import ZstdCompressor, FLUSH_FRAME
+from zstandard import ZstdCompressor, FLUSH_BLOCK
 
 class LogHandler():
     last_gzip_tell = 0
@@ -59,14 +59,17 @@ class LogHandler():
 
     # We specifically want to keep the file cleanly readable
     # at all points in time - we can sense that zstd stored
-    # some bytes to file using tell() and perform a frame
-    # flush to ensure it is cleanly readable
+    # some bytes to file using tell() and perform a flush
+    # to ensure it is cleanly readable
+    #
+    # The decoder may complain to stderr but the data
+    # should remain valid
     #
     # With gzip we must look at .fileobj.tell()
     #
     def flush(self):
         if self.urls_zstd.tell() != self.last_zstd_tell:
-            self.urls_zstd.flush(FLUSH_FRAME)
+            self.urls_zstd.flush(FLUSH_BLOCK)
             self.last_zstd_tell = self.urls_zstd.tell()
             print("Flush zstd")
 
