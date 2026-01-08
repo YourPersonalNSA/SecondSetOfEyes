@@ -80,6 +80,7 @@ class LogHandler():
 
 # https://github.com/bpftrace/bpftrace/blob/master/tools/execsnoop.bt
 # https://docs.python.org/3/library/asyncio-subprocess.html#asyncio.create_subprocess_exec
+# https://stackoverflow.com/questions/55457370/how-to-avoid-valueerror-separator-is-not-found-and-chunk-exceed-the-limit
 # https://mozillazg.com/2024/03/ebpf-tracepoint-syscalls-sys-enter-execve-can-not-get-filename-argv-values-case-en.html
 #
 
@@ -118,7 +119,7 @@ async def read_events_syscall(handler):
             //
             // dynamic buf size upsets the verifier, causing
             // excessive branching
-            while ($i < 65536) {
+            while ($i < 131072) {
                 if ($i + 64 > $count) { break; }
 
                 printf("%r", buf(uptr($arg_start + $i), 64));
@@ -127,11 +128,11 @@ async def read_events_syscall(handler):
             }
 
             // Final print
-            printf("%r\\0ENTER\\0%s\\0%s\\0%d\\n",
+            printf("%r\\0ENTER\\0%s\\0%s\\0%p\\0%d\\n",
                 buf(uptr($arg_start + $i), $count - $i),
                 strftime("%Y-%m-%dT%H:%M:%S%z", nsecs),
                 comm,
-                pid
+                curtask, pid
             );
         }
 
@@ -143,24 +144,27 @@ async def read_events_syscall(handler):
 
             $i = (uint64)0;
 
-            while ($i < 65536) {
+            while ($i < 131072) {
                 if ($i + 64 > $count) { break; }
                 printf("%r", buf(uptr($arg_start + $i), 64));
                 $i += 64;
             }
 
-            printf("%r\\0LEAVE\\0%d\\0%d\\n",
+            printf("%r\\0LEAVE\\0%p\\0%d\\0%d\\n",
                 buf(uptr($arg_start + $i), $count - $i),
-                pid,
+                curtask, pid,
                 args->ret
             );
         }
         """,
-        stdout=asyncio.subprocess.PIPE
+        stdout=asyncio.subprocess.PIPE,
+        limit=3*1024*1024
     )
 
 
     assert await proc.stdout.readline() == b"Attaching 4 probes...\n"
+
+    print("Ready")
 
     posted = {}
     solved = {}
@@ -174,6 +178,7 @@ async def read_events_syscall(handler):
         if head == b"ENTER\0":
             time = await proc.stdout.readuntil(b"\0")
             comm = await proc.stdout.readuntil(b"\0")
+            task = await proc.stdout.readuntil(b"\0")
             pida = await proc.stdout.readuntil(b"\n")
 
             time = time[:-1]
@@ -181,9 +186,11 @@ async def read_events_syscall(handler):
             pida = pida[:-1]
             argv = argv[:-1]
 
-            assert pida not in posted
+            key = (task, pida)
 
-            posted[pida] = dict(
+            assert key not in posted
+
+            posted[key] = dict(
                 time=time,
                 comm=comm,
                 argv=argv,
@@ -191,6 +198,7 @@ async def read_events_syscall(handler):
 
             pid = pida
         elif head == b"LEAVE\0":
+            task = await proc.stdout.readuntil(b"\0")
             pidb = await proc.stdout.readuntil(b"\0")
             retv = await proc.stdout.readuntil(b"\n")
 
@@ -198,9 +206,11 @@ async def read_events_syscall(handler):
             retv = retv[:-1]
             argv = argv[:-1]
 
-            assert pidb not in solved
+            key = (task, pidb)
 
-            solved[pidb] = dict(
+            assert key not in solved
+
+            solved[key] = dict(
                 retv=retv,
                 argv=argv
             )
@@ -209,15 +219,15 @@ async def read_events_syscall(handler):
         else:
             assert 0, f"Protocol break: {head}"
 
-        if pid in posted and pid in solved:
-            retv = solved[pid]["retv"]
-            time = posted[pid]["time"]
-            comm = posted[pid]["comm"]
-            argx = posted[pid]["argv"]
-            argy = solved[pid]["argv"]
+        if key in posted and key in solved:
+            retv = solved[key]["retv"]
+            time = posted[key]["time"]
+            comm = posted[key]["comm"]
+            argx = posted[key]["argv"]
+            argy = solved[key]["argv"]
 
-            del posted[pid]
-            del solved[pid]
+            del posted[key]
+            del solved[key]
 
             if retv == b"0":
                 entry = dict(
@@ -259,7 +269,8 @@ async def read_events_sched(handler):
             printf("\\0%s\\0", strftime("%Y-%m-%dT%H:%M:%S%z", nsecs));
         }
         """,
-        stdout=asyncio.subprocess.PIPE
+        stdout=asyncio.subprocess.PIPE,
+        limit=3*1024*1024
     )
 
     assert await proc.stdout.readline() == b"Attaching 1 probe...\n"
