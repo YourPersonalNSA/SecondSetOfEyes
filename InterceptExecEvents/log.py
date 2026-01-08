@@ -233,40 +233,27 @@ async def read_events_syscall(handler):
 
 # Alternative version that is unused at the present
 # May work on systems that lack syscall tracepoints
-async def read_events_sched():
+async def read_events_sched(handler):
     proc = await asyncio.create_subprocess_exec(
         "bpftrace",
         "-B",
         "none",
         "-e",
         """
-        #include <linux/sched.h>
-        #include <linux/mm_types.h>
-
         // This tracepoint is distinct from tracepoint:syscalls:sys_enter_exec*;
         // we only see successful execs here rather than all attempted
+        //
+        // This codepath targets kernel 4.19 which is somewhat busted:
+        // we cannot seem to read any memory there, and resort to
+        // reading procfs
+        //
+        // For short lived processes there will be no output,
+        // as failing cat() aborts
+        //
         tracepoint:sched:sched_process_exec {
-            $task=curtask;
-            $arg_start=$task->mm->arg_start;
-            $arg_end=$task->mm->arg_end;
-            $count = $arg_end-$arg_start;
+            cat("/proc/%d/cmdline", pid);
 
-            printf(\"%s\\0\", strftime("%Y-%m-%dT%H:%M:%S%z", nsecs));
-            printf(\"%s\\0\", comm);
-
-            // We have to get creative to print large buffers
-            // buf() is limited to 64 bytes by default
-            $i = (uint64)0;
-
-            while ($i < 4096) {
-                if ($count > $i) {
-                    printf(\"%r\", buf(uptr($arg_start + $i), $count - $i));
-                }
-
-                $i += 64;
-            }
-
-            printf(\"\\0\");
+            printf("\\0%s\\0", strftime("%Y-%m-%dT%H:%M:%S%z", nsecs));
         }
         """,
         stdout=asyncio.subprocess.PIPE
@@ -275,15 +262,24 @@ async def read_events_sched():
     assert await proc.stdout.readline() == b"Attaching 1 probe...\n"
 
     while True:
+        argv = await proc.stdout.readuntil(b"\0\0")
         time = await proc.stdout.readuntil(b"\0")
-        comm = await proc.stdout.readuntil(b"\0")
-        argv = await proc.stdout.readuntil(b"\0")
 
         time = time[:-1]
-        comm = comm[:-1]
         argv = argv[:-1]
 
-        print(time, comm, argv)
+        entry = dict(
+            time=time.decode(),
+            comm="",
+            argx="",
+            argy=argv.decode().split("\0")
+        )
+
+        handler.ensure_schedule()
+        handler.handle_event(json.dumps(entry).encode())
+
+        print(json.dumps(entry, indent=2))
+
 
 LogHandler.begin_next_file()
 handler = LogHandler()
