@@ -109,6 +109,7 @@ async def read_events_syscall(handler):
             $arg_start=$task->mm->arg_start;
             $arg_end=$task->mm->arg_end;
             $count = $arg_end-$arg_start;
+            $seqn = @enter_n[pid]++;
 
             // We have to get creative to print large buffers
             // buf() is limited to 64 bytes by default
@@ -117,8 +118,9 @@ async def read_events_syscall(handler):
             // We loop in a slightly roundabout way to avoid
             // a dynamic buf size as best we can
             //
-            // dynamic buf size upsets the verifier, causing
-            // excessive branching
+            // dynamic buf size makes things difficult for
+            // the verifier
+            //
             while ($i < 131072) {
                 if ($i + 64 > $count) { break; }
 
@@ -128,11 +130,10 @@ async def read_events_syscall(handler):
             }
 
             // Final print
-            printf("%r\\0ENTER\\0%s\\0%s\\0%p\\0%d\\n",
+            printf("%r\\0ENTER\\0%s\\0%s\\0%d\\0%d\\n",
                 buf(uptr($arg_start + $i), $count - $i),
                 strftime("%Y-%m-%dT%H:%M:%S%z", nsecs),
-                comm,
-                curtask, pid
+                comm, pid, $seqn
             );
         }
 
@@ -141,6 +142,7 @@ async def read_events_syscall(handler):
             $arg_start=$task->mm->arg_start;
             $arg_end=$task->mm->arg_end;
             $count = $arg_end-$arg_start;
+            $seqn = @leave_n[pid]++;
 
             $i = (uint64)0;
 
@@ -150,15 +152,21 @@ async def read_events_syscall(handler):
                 $i += 64;
             }
 
-            printf("%r\\0LEAVE\\0%p\\0%d\\0%d\\n",
+            printf("%r\\0LEAVE\\0%d\\0%d\\0%d\\n",
                 buf(uptr($arg_start + $i), $count - $i),
-                curtask, pid,
-                args->ret
+                pid, $seqn, args->ret
             );
+
+            // Maps have a limit of 4096 keys
+            // Avoid hitting that
+            if (args->ret == 0) {
+                delete(@enter_n[pid]);
+                delete(@leave_n[pid]);
+            }
         }
         """,
         stdout=asyncio.subprocess.PIPE,
-        limit=3*1024*1024
+        limit=256*1024*1024
     )
 
 
@@ -178,15 +186,16 @@ async def read_events_syscall(handler):
         if head == b"ENTER\0":
             time = await proc.stdout.readuntil(b"\0")
             comm = await proc.stdout.readuntil(b"\0")
-            task = await proc.stdout.readuntil(b"\0")
-            pida = await proc.stdout.readuntil(b"\n")
+            pida = await proc.stdout.readuntil(b"\0")
+            seqn = await proc.stdout.readuntil(b"\n")
 
             time = time[:-1]
             comm = comm[:-1]
             pida = pida[:-1]
+            seqn = seqn[:-1]
             argv = argv[:-1]
 
-            key = (task, pida)
+            key = (pida, seqn)
 
             assert key not in posted
 
@@ -195,18 +204,17 @@ async def read_events_syscall(handler):
                 comm=comm,
                 argv=argv,
             )
-
-            pid = pida
         elif head == b"LEAVE\0":
-            task = await proc.stdout.readuntil(b"\0")
             pidb = await proc.stdout.readuntil(b"\0")
+            seqn = await proc.stdout.readuntil(b"\0")
             retv = await proc.stdout.readuntil(b"\n")
 
             pidb = pidb[:-1]
+            seqn = seqn[:-1]
             retv = retv[:-1]
             argv = argv[:-1]
 
-            key = (task, pidb)
+            key = (pidb, seqn)
 
             assert key not in solved
 
@@ -214,8 +222,6 @@ async def read_events_syscall(handler):
                 retv=retv,
                 argv=argv
             )
-
-            pid = pidb
         else:
             assert 0, f"Protocol break: {head}"
 
@@ -240,9 +246,12 @@ async def read_events_syscall(handler):
                 handler.ensure_schedule()
                 handler.handle_event(json.dumps(entry).encode())
 
-                print(json.dumps(entry, indent=2))
+                #print(json.dumps(entry, indent=2))
             else:
-                assert argx == argy
+                if argx != argy:
+                    print(f"Surprise mismatch {retv} {argx} {argy}")
+
+        assert len(posted) + len(solved) < 1024, "Too many syscalls in flight"
 
 # Alternative version that is unused at the present
 # May work on systems that lack syscall tracepoints
@@ -270,7 +279,7 @@ async def read_events_sched(handler):
         }
         """,
         stdout=asyncio.subprocess.PIPE,
-        limit=3*1024*1024
+        limit=256*1024*1024
     )
 
     assert await proc.stdout.readline() == b"Attaching 1 probe...\n"
