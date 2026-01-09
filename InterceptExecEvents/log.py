@@ -5,6 +5,9 @@ import json
 from gzip import GzipFile
 from zstandard import ZstdCompressor, FLUSH_BLOCK
 
+# Run using:
+# BPFTRACE_PERF_RB_PAGES=1024 sudo -E python3 log.py
+
 class LogHandler():
     last_gzip_tell = 0
     last_zstd_tell = 0
