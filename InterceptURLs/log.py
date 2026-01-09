@@ -3,7 +3,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler, HTTPStatus
 from datetime import datetime, timedelta
 
 from gzip import GzipFile
-from zstandard import ZstdCompressor, FLUSH_FRAME
+from zstandard import ZstdCompressor, FLUSH_BLOCK
 
 # Endpoints:
 # - Tab API data:
@@ -98,11 +98,14 @@ class InterceptURLHandler(BaseHTTPRequestHandler):
     # some bytes to file using tell() and perform a frame
     # flush to ensure it is cleanly readable
     #
+    # The decoder may complain to stderr but the data
+    # should remain valid
+    #
     # With gzip we must look at .fileobj.tell()
     #
     def flush(self):
         if self.urls_zstd.tell() != self.last_zstd_tell:
-            self.urls_zstd.flush(FLUSH_FRAME)
+            self.urls_zstd.flush(FLUSH_BLOCK)
             self.last_zstd_tell = self.urls_zstd.tell()
             print("Flush zstd")
 
