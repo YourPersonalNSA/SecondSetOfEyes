@@ -5,21 +5,33 @@ import duckdb
 x = duckdb.connect()
 x.sql("create table urls as (select * from 'urls/*.jsonl.zst')")
 
-today = datetime.now().astimezone().replace(
-    hour=0,
-    minute=0,
-    second=0,
-    microsecond=0
-)
+def query_past(when):
+    midnight = datetime.now().astimezone().replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0
+    )
 
-yesterday = today - timedelta(days=1)
+    bits = when.split(" ")
+    time = bits.pop(0)
+    unit = bits.pop(0)
 
-today = today.isoformat()
-yesterday = yesterday.isoformat()
+    if "month" in unit:
+        since = midnight - timedelta(weeks=4*int(time))
+    elif "week" in unit:
+        since = midnight - timedelta(weeks=int(time))
+    elif "day" in unit:
+        since = midnight - timedelta(days=int(time))
 
-result = x.sql(f"select strftime(time::TIMESTAMPTZ, '%H:%M'), url, title from urls where time between '{yesterday}' and '{today}'")
+    until = since + timedelta(days=1)
 
-print(f"Log opened {yesterday}")
+    since = since.isoformat()
+    until = until.isoformat()
 
-for time, url, title in result.fetchall():
-    print(f"{time} {title} {url}")
+    result = x.sql(f"select strftime(time::TIMESTAMPTZ, '%H:%M'), url, title from urls where time between '{since}' and '{until}'")
+
+    print(f"Log opened {since}")
+
+    for time, url, title in result.fetchall():
+        print(f"{time} {title} {url}")
